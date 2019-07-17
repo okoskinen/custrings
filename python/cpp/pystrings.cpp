@@ -802,7 +802,7 @@ static PyObject* n_createFromBools( PyObject* self, PyObject* args )
     const char* tstr = PyUnicode_AsUTF8(pytstr);
     if( pyfstr==Py_None )
     {
-        PyErr_Format(PyExc_TypeError,"nvstrings.from_bools(): false must not be null");
+        PyErr_Format(PyExc_ValueError,"nvstrings.from_bools(): false must not be null");
         Py_RETURN_NONE;
     }
     const char* fstr = PyUnicode_AsUTF8(pyfstr);
@@ -1924,6 +1924,59 @@ static PyObject* n_replace( PyObject* self, PyObject* args )
         message = e.what();
     }
     Py_END_ALLOW_THREADS
+    if( !message.empty() )
+        PyErr_Format(PyExc_ValueError,message.c_str());
+    if( rtn )
+        return PyLong_FromVoidPtr((void*)rtn);
+    Py_RETURN_NONE;
+}
+
+static PyObject* n_replace_multi( PyObject* self, PyObject* args )
+{
+    NVStrings* tptr = (NVStrings*)PyLong_AsVoidPtr(PyTuple_GetItem(args,0));
+    PyObject* argPats = PyTuple_GetItem(args,1);
+    PyObject* argRepls = PyTuple_GetItem(args,2);
+    bool bregex = (bool)PyObject_IsTrue(PyTuple_GetItem(args,3));
+    NVStrings* repls = (NVStrings*)PyLong_AsVoidPtr(argRepls);
+
+    NVStrings* rtn = 0;
+    std::string message;
+    if( bregex )
+    {
+        // convert list into vector
+        unsigned int count = (unsigned int)PyList_Size(argPats);
+        std::vector<const char*> pats;
+        for( unsigned int idx=0; idx < count; ++idx )
+        {
+            PyObject* pystr = PyList_GetItem(argPats,idx);
+            if( pystr != Py_None )
+                pats.push_back(PyUnicode_AsUTF8(pystr));
+        }
+        Py_BEGIN_ALLOW_THREADS
+        try
+        {
+            rtn = tptr->replace_re(pats,*repls);
+        }
+        catch(const std::exception& e)
+        {
+            message = e.what();
+        }
+        Py_END_ALLOW_THREADS
+    }
+    else
+    {
+        NVStrings* ptns = (NVStrings*)PyLong_AsVoidPtr(PyObject_GetAttrString(argPats,"m_cptr"));
+        Py_BEGIN_ALLOW_THREADS
+        try
+        {
+            rtn = tptr->replace(*ptns,*repls);
+        }
+        catch(const std::exception& e)
+        {
+            message = e.what();
+        }
+        Py_END_ALLOW_THREADS
+    }
     if( !message.empty() )
         PyErr_Format(PyExc_ValueError,message.c_str());
     if( rtn )
@@ -3197,6 +3250,55 @@ static PyObject* n_sublist( PyObject* self, PyObject* args )
 }
 
 //
+static PyObject* n_scatter( PyObject* self, PyObject* args )
+{
+    NVStrings* tptr = (NVStrings*)PyLong_AsVoidPtr(PyTuple_GetItem(args,0));
+    PyObject* pystrs = PyTuple_GetItem(args,1);
+
+    std::string cname = pystrs->ob_type->tp_name;
+    if( cname.compare("nvstrings")!=0 )
+    {
+        PyErr_Format(PyExc_TypeError,"scatter: strs must be nvstrings type");
+        Py_RETURN_NONE;
+    }
+    NVStrings* strs = (NVStrings*)PyLong_AsVoidPtr(PyObject_GetAttrString(pystrs,"m_cptr"));
+
+    PyObject* pyidxs = PyTuple_GetItem(args,2);
+    DataBuffer<int> dbvalues(pyidxs);
+    if( dbvalues.is_error() )
+    {
+        PyErr_Format(PyExc_TypeError,"scatter: %s",dbvalues.get_error_text());
+        Py_RETURN_NONE;
+    }
+    if( dbvalues.get_type_width()!=sizeof(int) )
+    {
+        PyErr_Format(PyExc_TypeError,"scatter: values must be of type int32");
+        Py_RETURN_NONE;
+    }
+    unsigned int count = dbvalues.get_count();
+    if( count && (count < strs->size()) )
+    {
+        PyErr_Format(PyExc_ValueError,"scatter: number of values must match the number of strings in strs argument");
+        Py_RETURN_NONE;
+    }
+
+    bool bdevmem = dbvalues.is_device_type();
+
+    NVStrings* rtn = 0;
+    std::string message;
+    Py_BEGIN_ALLOW_THREADS
+    rtn = tptr->scatter(*strs,dbvalues.get_values(),bdevmem);
+    Py_END_ALLOW_THREADS
+
+    //
+    if( rtn )
+        return PyLong_FromVoidPtr((void*)rtn);
+    if( !message.empty() )
+        PyErr_Format(PyExc_IndexError,message.c_str());
+    Py_RETURN_NONE;
+}
+
+//
 static PyObject* n_remove_strings( PyObject* self, PyObject* args )
 {
     NVStrings* tptr = (NVStrings*)PyLong_AsVoidPtr(PyTuple_GetItem(args,0));
@@ -3736,6 +3838,7 @@ static PyMethodDef s_Methods[] = {
     { "n_slice_from", n_slice_from, METH_VARARGS, "" },
     { "n_slice_replace", n_slice_replace, METH_VARARGS, "" },
     { "n_replace", n_replace, METH_VARARGS, "" },
+    { "n_replace_multi", n_replace_multi, METH_VARARGS, "" },
     { "n_replace_with_backrefs", n_replace_with_backrefs, METH_VARARGS, "" },
     { "n_fillna", n_fillna, METH_VARARGS, "" },
     { "n_insert", n_insert, METH_VARARGS, "" },
@@ -3773,6 +3876,7 @@ static PyMethodDef s_Methods[] = {
     { "n_order", n_order, METH_VARARGS, "" },
     { "n_gather", n_gather, METH_VARARGS, "" },
     { "n_sublist", n_sublist, METH_VARARGS, "" },
+    { "n_scatter", n_scatter, METH_VARARGS, "" },
     { "n_isalnum", n_isalnum, METH_VARARGS, "" },
     { "n_isalpha", n_isalpha, METH_VARARGS, "" },
     { "n_isdigit", n_isdigit, METH_VARARGS, "" },

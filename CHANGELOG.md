@@ -1,13 +1,27 @@
 # cuStrings/nvStrings 0.9.0 (TBD)
 
+- PR #355 Add and use unified build script
+
 ## New Features
+
+- PR #363 Added scatter method to nvstrings
+- PR #371 Added replace() with multiple strings parameters
 
 ## Improvements
 
+- PR #354 Removed rmm submodule
+- PR #359 Set default sort-type to alphabetical
+- PR #357 Improved error checking on memory allocates
+- PR #358 Added improved hash algorithm to reduce collisions
+- PR #369 Reconfigure C++ source directory structure
+- PR #370 Updated memsize() to include pointer memory too
+
 ## Bug Fixes
 
+- PR #353 Fixed sizer calculation for multiple replaces
 
-# cuStrings/nvStrings 0.8.0 (TBD)
+
+# cuStrings/nvStrings 0.8.0 (27 June 2019)
 
 ## New Features
 
@@ -37,6 +51,8 @@
 - PR #329 Fixed documentation errors in source code
 - PR #334 Regex stack-size logic moved to host code
 - PR #343 Fixed a flag which is necessary for conda install in Dockerfile
+- PR #347 Configure Sphinx to render params correctly
+
 
 # cuStrings/nvStrings 0.7.0 (10 May 2019)
 

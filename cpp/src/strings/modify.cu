@@ -14,24 +14,20 @@
 * limitations under the License.
 */
 
+#include <cstdio>
 #include <exception>
 #include <sstream>
 #include <cuda_runtime.h>
-#include <device_launch_parameters.h>
 #include <thrust/device_vector.h>
 #include <thrust/host_vector.h>
-#include <thrust/execution_policy.h>
 #include <thrust/for_each.h>
 #include <thrust/sort.h>
 #include <rmm/rmm.h>
 #include <rmm/thrust_rmm_allocator.h>
 #include "NVStrings.h"
 #include "NVStringsImpl.h"
-#include "custring_view.cuh"
-#include "regex/regex.cuh"
-#include "regex/backref.h"
-#include "unicode/is_flags.h"
-#include "util.h"
+#include "../custring_view.cuh"
+#include "../util.h"
 
 //
 NVStrings* NVStrings::slice_replace( const char* repl, int start, int stop )
@@ -40,9 +36,8 @@ NVStrings* NVStrings::slice_replace( const char* repl, int start, int stop )
         throw std::invalid_argument("nvstrings::slice_replace parameter cannot be null");
     auto execpol = rmm::exec_policy(0);
     unsigned int replen = (unsigned int)strlen(repl);
-    char* d_repl = nullptr;
-    RMM_ALLOC(&d_repl,replen,0);
-    cudaMemcpy(d_repl,repl,replen,cudaMemcpyHostToDevice);
+    char* d_repl = device_alloc<char>(replen,0);
+    CUDA_TRY( cudaMemcpyAsync(d_repl,repl,replen,cudaMemcpyHostToDevice))
     // compute size of output buffer
     unsigned int count = size();
     custring_view_array d_strings = pImpl->getStringsPtr();
@@ -112,21 +107,12 @@ NVStrings* NVStrings::slice_replace( const char* repl, int start, int stop )
 NVStrings* NVStrings::replace( const char* str, const char* repl, int maxrepl )
 {
     if( !str || !*str )
-        throw std::invalid_argument("nvstrings::replace parameter cannot be null or empty");
+        throw std::invalid_argument("replace parameter cannot be null or empty");
     auto execpol = rmm::exec_policy(0);
-    unsigned int ssz = (unsigned int)strlen(str);
-    char* d_str = nullptr;
-    RMM_ALLOC(&d_str,ssz,0);
-    cudaMemcpy(d_str,str,ssz,cudaMemcpyHostToDevice);
-    unsigned int sszch = custring_view::chars_in_string(str,ssz);
-
+    custring_view* d_str = custring_from_host(str);
     if( !repl )
         repl = "";
-    unsigned int rsz = (unsigned int)strlen(repl);
-    char* d_repl = nullptr;
-    RMM_ALLOC(&d_repl,rsz,0);
-    cudaMemcpy(d_repl,repl,rsz,cudaMemcpyHostToDevice);
-    unsigned int rszch = custring_view::chars_in_string(repl,rsz);
+    custring_view* d_repl = custring_from_host(repl);
 
     // compute size of the output
     unsigned int count = size();
@@ -134,7 +120,7 @@ NVStrings* NVStrings::replace( const char* str, const char* repl, int maxrepl )
     rmm::device_vector<size_t> sizes(count,0);
     size_t* d_sizes = sizes.data().get();
     thrust::for_each_n(execpol->on(0), thrust::make_counting_iterator<unsigned int>(0), count,
-        [d_strings, d_str, ssz, sszch, d_repl, rsz, rszch, maxrepl, d_sizes] __device__(unsigned int idx){
+        [d_strings, d_str, d_repl, maxrepl, d_sizes] __device__(unsigned int idx){
             custring_view* dstr = d_strings[idx];
             if( !dstr )
                 return;
@@ -142,13 +128,13 @@ NVStrings* NVStrings::replace( const char* str, const char* repl, int maxrepl )
             if( mxn < 0 )
                 mxn = dstr->chars_count(); //max possible replaces for this string
             unsigned int bytes = dstr->size(), nchars = dstr->chars_count();
-            int pos = dstr->find(d_str,ssz);
+            int pos = dstr->find(*d_str);
             // counting bytes and chars
             while((pos >= 0) && (mxn > 0))
             {
-                bytes += rsz - ssz;
-                nchars += rszch - sszch;
-                pos = dstr->find(d_str,ssz,(unsigned)pos+sszch); // next one
+                bytes += d_repl->size() - d_str->size();
+                nchars += d_repl->chars_count() - d_str->chars_count();
+                pos = dstr->find(*d_str,(unsigned)pos+d_str->chars_count()); // next one
                 --mxn;
             }
             unsigned int size = custring_view::alloc_size(bytes,nchars);
@@ -171,7 +157,7 @@ NVStrings* NVStrings::replace( const char* str, const char* repl, int maxrepl )
     custring_view_array d_results = rtn->pImpl->getStringsPtr();
     size_t* d_offsets = offsets.data().get();
     thrust::for_each_n(execpol->on(0), thrust::make_counting_iterator<unsigned int>(0), count,
-        [d_strings, d_str, ssz, sszch, d_repl, rsz, d_buffer, d_offsets, maxrepl, d_results] __device__(unsigned int idx){
+        [d_strings, d_str, d_repl, d_buffer, d_offsets, maxrepl, d_results] __device__(unsigned int idx){
             custring_view* dstr = d_strings[idx];
             if( !dstr )
                 return;
@@ -183,19 +169,17 @@ NVStrings* NVStrings::replace( const char* str, const char* repl, int maxrepl )
             char* sptr = dstr->data();
             char* optr = buffer;
             unsigned int size = dstr->size();
-            int pos = dstr->find(d_str,ssz), lpos=0;
+            int pos = dstr->find(*d_str), lpos=0;
             while((pos >= 0) && (mxn > 0))
-            {                                                 // i:bbbbsssseeee
-                int spos = dstr->byte_offset_for(pos);        //       ^
-                memcpy(optr,sptr+lpos,spos-lpos);             // o:bbbb
-                optr += spos - lpos;                          //       ^
-                memcpy(optr,d_repl,rsz);                      // o:bbbbrrrr
-                optr += rsz;                                  //           ^
-                lpos = spos + ssz;                            // i:bbbbsssseeee
-                pos = dstr->find(d_str,ssz,pos+sszch);        //           ^
+            {                                                      // i:bbbbsssseeee
+                int spos = dstr->byte_offset_for(pos);             //       ^
+                copy_and_incr(optr,sptr+lpos,spos-lpos);           // o:bbbb
+                copy_and_incr(optr,d_repl->data(),d_repl->size()); // o:bbbbrrrr
+                lpos = spos + d_str->size();//ssz;                 // i:bbbbsssseeee
+                pos = dstr->find(*d_str,pos+d_str->chars_count()); //           ^
                 --mxn;
             }
-            memcpy(optr,sptr+lpos,size-lpos);                 // o:bbbbrrrreeee
+            memcpy(optr,sptr+lpos,size-lpos);                      // o:bbbbrrrreeee
             unsigned int nsz = (unsigned int)(optr - buffer) + size - lpos;
             d_results[idx] = custring_view::create_from(buffer,buffer,nsz);
         });
@@ -205,361 +189,110 @@ NVStrings* NVStrings::replace( const char* str, const char* repl, int maxrepl )
     return rtn;
 }
 
-template<size_t stack_size>
-struct replace_regex_sizer_fn
+// used by both mult-replaces below
+// also does the size calculations inline
+struct replace_multi_fn
 {
-    dreprog* prog;
     custring_view_array d_strings;
-    char* d_repl;
-    unsigned int rsz, rszch;
-    int maxrepl;
-    size_t* d_sizes;
-    __device__ void operator()(unsigned int idx)
-    {
-        custring_view* dstr = d_strings[idx];
-        if( !dstr )
-            return;
-        u_char data1[stack_size], data2[stack_size];
-        prog->set_stack_mem(data1,data2);
-        int mxn = maxrepl;
-        if( mxn < 0 )
-            mxn = dstr->chars_count(); //max possible replaces for this string
-        unsigned int bytes = dstr->size(), nchars = dstr->chars_count();
-        int begin = 0, end = (int)nchars;
-        int result = prog->find(idx,dstr,begin,end);
-        while((result > 0) && (mxn > 0))
-        {
-            bytes += rsz - (dstr->byte_offset_for(end)-dstr->byte_offset_for(begin));
-            nchars += rszch - (end-begin);
-            begin = end;
-            end = (int)nchars;
-            result = prog->find(idx,dstr,begin,end); // next one
-            --mxn;
-        }
-        unsigned int size = custring_view::alloc_size(bytes,nchars);
-        d_sizes[idx] = ALIGN_SIZE(size);
-    }
-};
-
-template<size_t stack_size>
-struct replace_regex_fn
-{
-    dreprog* prog;
-    custring_view_array d_strings;
-    char* d_repl;
-    unsigned int rsz;
-    char* d_buffer;
+    custring_view_array d_targets;
+    unsigned int target_count;
+    custring_view_array d_repls;
+    unsigned int repl_count;
     size_t* d_offsets;
-    int maxrepl;
+    bool bcompute_size_only{true};
+    char* d_buffer;
     custring_view_array d_results;
+
     __device__ void operator()(unsigned int idx)
     {
         custring_view* dstr = d_strings[idx];
         if( !dstr )
             return;
-        u_char data1[stack_size], data2[stack_size];
-        prog->set_stack_mem(data1,data2);
-        int mxn = maxrepl;
-        int nchars = (int)dstr->chars_count();
-        if( mxn < 0 )
-            mxn = nchars; //max possible replaces for this string
-        char* buffer = d_buffer + d_offsets[idx];  // output buffer
-        char* sptr = dstr->data();                 // input buffer
-        char* optr = buffer;                       // running output pointer
-        unsigned int size = dstr->size();          // number of byte in input string
-        int lpos = 0, begin = 0, end = nchars;     // working vars
-        // copy input to output replacing strings as we go
-        int result = prog->find(idx,dstr,begin,end);
-        while((result > 0) && (mxn > 0))
-        {                                                 // i:bbbbsssseeee
-            int spos = dstr->byte_offset_for(begin);      //       ^
-            memcpy(optr,sptr+lpos,spos-lpos);             // o:bbbb
-            optr += spos - lpos;                          //       ^
-            memcpy(optr,d_repl,rsz);                      // o:bbbbrrrr
-            optr += rsz;                                  //           ^
-            lpos = dstr->byte_offset_for(end);            // i:bbbbsssseeee
-            begin = end;                                  //           ^
-            end = nchars;
-            result = prog->find(idx,dstr,begin,end);
-            --mxn;
-        }                                                 // copy the rest:
-        memcpy(optr,sptr+lpos,size-lpos);                 // o:bbbbrrrreeee
-        unsigned int nsz = (unsigned int)(optr - buffer) + size - lpos;
-        d_results[idx] = custring_view::create_from(buffer,buffer,nsz);
-    }
-};
-
-// same as above except parameter is regex
-NVStrings* NVStrings::replace_re( const char* pattern, const char* repl, int maxrepl )
-{
-    if( !pattern || !*pattern )
-        throw std::invalid_argument("nvstrings::replace_re parameter cannot be null or empty");
-    unsigned int count = size();
-    if( count==0 )
-        return new NVStrings(count);
-    auto execpol = rmm::exec_policy(0);
-    // compile regex into device object
-    const char32_t* ptn32 = to_char32(pattern);
-    dreprog* prog = dreprog::create_from(ptn32,get_unicode_flags());
-    delete ptn32;
-    // allocate regex working memory if necessary
-    int regex_insts = prog->inst_counts();
-    if( regex_insts > MAX_STACK_INSTS )
-    {
-        if( !prog->alloc_relists(count) )
-        {
-            std::ostringstream message;
-            message << "nvstrings::replace_re: number of instructions " << prog->inst_counts();
-            message << " and number of strings " << count;
-            message << " exceeds available memory";
-            dreprog::destroy(prog);
-            throw std::invalid_argument(message.str());
-        }
-    }
-
-    //
-    // copy replace string to device memory
-    if( !repl )
-        repl = "";
-    unsigned int rsz = (unsigned int)strlen(repl);
-    char* d_repl = nullptr;
-    RMM_ALLOC(&d_repl,rsz,0);
-    cudaMemcpy(d_repl,repl,rsz,cudaMemcpyHostToDevice);
-    unsigned int rszch = custring_view::chars_in_string(repl,rsz);
-
-    // compute size of the output
-    custring_view_array d_strings = pImpl->getStringsPtr();
-    rmm::device_vector<size_t> sizes(count,0);
-    size_t* d_sizes = sizes.data().get();
-    if( (regex_insts > MAX_STACK_INSTS) || (regex_insts <= 10) )
-        thrust::for_each_n(execpol->on(0), thrust::make_counting_iterator<unsigned int>(0), count,
-            replace_regex_sizer_fn<RX_STACK_SMALL>{prog, d_strings, d_repl, rsz, rszch, maxrepl, d_sizes});
-    else if( regex_insts <= 100 )
-        thrust::for_each_n(execpol->on(0), thrust::make_counting_iterator<unsigned int>(0), count,
-            replace_regex_sizer_fn<RX_STACK_MEDIUM>{prog, d_strings, d_repl, rsz, rszch, maxrepl, d_sizes});
-    else
-        thrust::for_each_n(execpol->on(0), thrust::make_counting_iterator<unsigned int>(0), count,
-            replace_regex_sizer_fn<RX_STACK_LARGE>{prog, d_strings, d_repl, rsz, rszch, maxrepl, d_sizes});
-
-    //
-    // create output object
-    NVStrings* rtn = new NVStrings(count);
-    char* d_buffer = rtn->pImpl->createMemoryFor(d_sizes);
-    if( d_buffer==0 )
-    {
-        dreprog::destroy(prog);
-        RMM_FREE(d_repl,0);
-        return rtn; // all strings are null
-    }
-    // create offsets
-    rmm::device_vector<size_t> offsets(count,0);
-    thrust::exclusive_scan(execpol->on(0),sizes.begin(),sizes.end(),offsets.begin());
-    // do the replace
-    custring_view_array d_results = rtn->pImpl->getStringsPtr();
-    size_t* d_offsets = offsets.data().get();
-    if( (regex_insts > MAX_STACK_INSTS) || (regex_insts <= 10) )
-        thrust::for_each_n(execpol->on(0), thrust::make_counting_iterator<unsigned int>(0), count,
-            replace_regex_fn<RX_STACK_SMALL>{prog, d_strings, d_repl, rsz, d_buffer, d_offsets, maxrepl, d_results});
-    else if( regex_insts <= 100 )
-        thrust::for_each_n(execpol->on(0), thrust::make_counting_iterator<unsigned int>(0), count,
-            replace_regex_fn<RX_STACK_MEDIUM>{prog, d_strings, d_repl, rsz, d_buffer, d_offsets, maxrepl, d_results});
-    else
-        thrust::for_each_n(execpol->on(0), thrust::make_counting_iterator<unsigned int>(0), count,
-            replace_regex_fn<RX_STACK_LARGE>{prog, d_strings, d_repl, rsz, d_buffer, d_offsets, maxrepl, d_results});
-    //
-    dreprog::destroy(prog);
-    RMM_FREE(d_repl,0);
-    return rtn;
-}
-
-// using stack memory is more efficient but we want to keep the size to a minimum
-// so we have a small, medium, and large cases handled here
-template<size_t stack_size>
-struct backrefs_sizer_fn
-{
-    dreprog* prog;
-    custring_view_array d_strings;
-    unsigned int rsz, rszch;
-    thrust::pair<int,int>* d_brefs;
-    unsigned int refcount;
-    size_t* d_sizes;
-    __device__ void operator()(unsigned int idx)
-    {
-        custring_view* dstr = d_strings[idx];
-        if( !dstr )
-            return;
-        u_char data1[stack_size], data2[stack_size];
-        prog->set_stack_mem(data1,data2);
-        unsigned int bytes = dstr->size(), nchars = dstr->chars_count();
-        int begin = 0, end = (int)nchars;
-        while( prog->find(idx,dstr,begin,end) > 0 )
-        {
-            nchars += rszch - (end-begin);
-            bytes += rsz - (dstr->byte_offset_for(end)-dstr->byte_offset_for(begin));
-            for( unsigned int j=0; j < refcount; ++j ) // eval each ref
+        char* buffer = nullptr;
+        if( !bcompute_size_only )
+            buffer = d_buffer + d_offsets[idx];
+        char* optr = buffer;
+        unsigned int nbytes = dstr->size(), nchars = dstr->chars_count();
+        char* sptr = dstr->data();
+        unsigned int size = nbytes, spos = 0, lpos = 0;
+        while( spos < size )
+        {   // check each character against each target
+            for( int tidx=0; tidx < target_count; ++tidx )
             {
-                int refidx = d_brefs[j].first; // backref indicator
-                int spos=begin, epos=end;      // modified by extract
-                if( (prog->extract(idx,dstr,spos,epos,refidx-1)<=0) || (epos <= spos) )
-                    continue; // no value for this ref
-                nchars += epos - spos;  // add up chars
-                spos = dstr->byte_offset_for(spos); // convert to bytes
-                bytes += dstr->byte_offset_for(epos) - spos; // add up bytes
+                custring_view* dtgt = d_targets[tidx];
+                if( dtgt && // skip over any nulls
+                    (dtgt->size() <= (size-spos)) && // check fit
+                    (dtgt->compare(sptr+spos,dtgt->size())==0) ) // does it match
+                {   // found one
+                    custring_view* d_repl = (repl_count==1 ? d_repls[0]:d_repls[tidx]);
+                    if( bcompute_size_only )
+                    {
+                        nbytes += (d_repl ? d_repl->size():0) - dtgt->size();
+                        nchars += (d_repl ? d_repl->chars_count():0) - dtgt->chars_count();
+                    }
+                    else
+                    {
+                        copy_and_incr(optr,sptr+lpos,spos-lpos);               // copy left
+                        if( d_repl )                                           // and
+                            copy_and_incr(optr,d_repl->data(),d_repl->size()); // replace
+                        lpos = spos + dtgt->size();
+                    }
+                    spos += dtgt->size()-1;
+                    break;
+                }
             }
-            begin = end;
-            end = (int)dstr->chars_count();
+            ++spos;
         }
-        unsigned int size = custring_view::alloc_size(bytes,nchars);
-        d_sizes[idx] = ALIGN_SIZE(size); // new size for this string
-    }
-};
-
-template<size_t stack_size>
-struct backrefs_fn
-{
-    dreprog* prog;
-    custring_view_array d_strings;
-    char* d_repl;
-    unsigned int rsz;
-    size_t* d_offsets;
-    thrust::pair<int,int>* d_brefs;
-    unsigned int refcount;
-    char* d_buffer;
-    custring_view_array d_results;
-    __device__ void operator()(unsigned int idx)
-    {
-        custring_view* dstr = d_strings[idx];
-        if( !dstr )                                                   // abcd-efgh   X\1+\2Z
-            return; // nulls create nulls                             // ([a-z])-([a-z]) ==>  abcXd+eZfgh
-        u_char data1[stack_size], data2[stack_size];
-        prog->set_stack_mem(data1,data2);
-        char* buffer = d_buffer + d_offsets[idx]; // output buffer
-        char* optr = buffer; // running output pointer
-        char* sptr = dstr->data();                                           // abcd-efgh
-        int nchars = (int)dstr->chars_count();                               // ^
-        int lpos = 0, begin = 0, end = (int)nchars;
-        // insert extracted strings left-to-right
-        while( prog->find(idx,dstr,begin,end) > 0 )
+        if( bcompute_size_only )
         {
-            // we have found the section that needs to be replaced
-            int left = dstr->byte_offset_for(begin)-lpos;
-            memcpy( optr, sptr, left );                                      // abc________
-            optr += left;                                                    //    ^
-            int ilpos = 0; // last end pos of replace template
-            char* rptr = d_repl; // running ptr for replace template         // X+Z
-            for( unsigned int j=0; j < refcount; ++j ) // eval each ref      // 1st loop      2nd loop
-            {                                                                // ------------  --------------
-                int refidx = d_brefs[j].first; // backref number             // X+Z           X+Z
-                int ipos = d_brefs[j].second;  // insert position            //  ^              ^
-                int len = ipos - ilpos; // bytes to copy from input
-                copy_and_incr_both(optr,rptr,len);                           // abcX_______   abcXd+_______
-                ilpos += len;  // update last-position
-                int spos=begin, epos=end;  // these are modified by extract
-                if( (prog->extract(idx,dstr,spos,epos,refidx-1)<=0) ||       // d             e
-                    (epos <= spos) )
-                    continue; // no value for this ref
-                spos = dstr->byte_offset_for(spos); // convert to bytes
-                int bytes = dstr->byte_offset_for(epos) - spos;
-                copy_and_incr(optr,dstr->data()+spos,bytes);                 // abcXd______   abcXd+e______
-            }
-            if( rptr < d_repl+rsz ) // copy remainder of template            // abcXd+eZ___
-                copy_and_incr(optr,rptr,(unsigned int)(d_repl-rptr) + rsz);
-            lpos = dstr->byte_offset_for(end);
-            sptr = dstr->data() + lpos;                                      // abcd-efgh
-            begin = end;                                                     //       ^
-            end = (int)dstr->chars_count();
+            unsigned int nsize = custring_view::alloc_size(nbytes,nchars);
+            d_offsets[idx] = ALIGN_SIZE(nsize);
         }
-        if( sptr < dstr->data()+dstr->size() )                               // abcXd+eZfgh
-            copy_and_incr(optr,sptr,(unsigned int)(dstr->data()-sptr) + dstr->size());
-        unsigned int nsz = (unsigned int)(optr - buffer); // compute output size
-        d_results[idx] = custring_view::create_from(buffer,buffer,nsz); // new string
+        else
+        {
+            memcpy(optr,sptr+lpos,size-lpos); // copy remainder
+            unsigned int nsz = (unsigned int)(optr - buffer) + size - lpos;
+            d_results[idx] = custring_view::create_from(buffer,buffer,nsz);
+        }
     }
 };
 
-// not even close to the others
-NVStrings* NVStrings::replace_with_backrefs( const char* pattern, const char* repl )
+//
+NVStrings* NVStrings::replace( NVStrings& targets, NVStrings& repls )
 {
-    if( !pattern || !*pattern )
-        throw std::invalid_argument("nvstrings::replace_with_backrefs parameter cannot be null or empty");
-    unsigned int count = size();
-    if( count==0 || repl==0 )
-        return new NVStrings(count); // returns all nulls
+    if( targets.size()==0 || repls.size()==0 )
+        throw std::invalid_argument("replace targets and repls parameters cannot be empty");
+    if( repls.size()>1 && (repls.size() != targets.size()) )
+        throw std::invalid_argument("replace targets and replacement sizes must match");
     auto execpol = rmm::exec_policy(0);
-    // compile regex into device object
-    const char32_t* ptn32 = to_char32(pattern);
-    dreprog* prog = dreprog::create_from(ptn32,get_unicode_flags());
-    delete ptn32;
-    // allocate regex working memory if necessary
-    int regex_insts = prog->inst_counts();
-    if( regex_insts > MAX_STACK_INSTS )
-    {
-        if( !prog->alloc_relists(count) )
-        {
-            std::ostringstream message;
-            message << "nvstrings::replace_with_backrefs: number of instructions (" << prog->inst_counts() << ") ";
-            message << "and number of strings (" << count << ") ";
-            message << "exceeds available memory";
-            dreprog::destroy(prog);
-            throw std::invalid_argument(message.str());
-        }
-    }
-    //
-    // parse the repl string for backref indicators
-    std::vector<thrust::pair<int,int> > brefs;
-    std::string srepl = parse_backrefs(repl,brefs);
-    unsigned int rsz = (unsigned int)srepl.size();
-    char* d_repl = nullptr;
-    RMM_ALLOC(&d_repl,rsz,0);
-    cudaMemcpy(d_repl,srepl.c_str(),rsz,cudaMemcpyHostToDevice);
-    unsigned int rszch = custring_view::chars_in_string(srepl.c_str(),rsz);
-    rmm::device_vector<thrust::pair<int,int> > dbrefs(brefs);
-    auto d_brefs = dbrefs.data().get();
-    unsigned int refcount = (unsigned int)dbrefs.size();
-    // if refcount != prog->group_counts() -- probably should throw exception
 
     // compute size of the output
-    custring_view_array d_strings = pImpl->getStringsPtr();
+    custring_view** d_strings = pImpl->getStringsPtr();
+    unsigned int count = size();
+    custring_view** d_targets = targets.pImpl->getStringsPtr();
+    unsigned int target_count = targets.size();
+    custring_view_array d_repls = repls.pImpl->getStringsPtr();
+    unsigned int repl_count = repls.size();
     rmm::device_vector<size_t> sizes(count,0);
     size_t* d_sizes = sizes.data().get();
-    if( (regex_insts > MAX_STACK_INSTS) || (regex_insts <= 10) )
-        thrust::for_each_n(execpol->on(0), thrust::make_counting_iterator<unsigned int>(0), count,
-            backrefs_sizer_fn<RX_STACK_SMALL>{prog, d_strings, rsz, rszch, d_brefs, refcount, d_sizes});
-    else if( regex_insts <= 100 )
-        thrust::for_each_n(execpol->on(0), thrust::make_counting_iterator<unsigned int>(0), count,
-            backrefs_sizer_fn<RX_STACK_MEDIUM>{prog, d_strings, rsz, rszch, d_brefs, refcount, d_sizes});
-    else
-        thrust::for_each_n(execpol->on(0), thrust::make_counting_iterator<unsigned int>(0), count,
-            backrefs_sizer_fn<RX_STACK_LARGE>{prog, d_strings, rsz, rszch, d_brefs, refcount, d_sizes});
-
+    // get the sizes
+    thrust::for_each_n(execpol->on(0), thrust::make_counting_iterator<unsigned int>(0), count,
+        replace_multi_fn{d_strings, d_targets, target_count, d_repls, repl_count, d_sizes} );
     //
     // create output object
     NVStrings* rtn = new NVStrings(count);
     char* d_buffer = rtn->pImpl->createMemoryFor(d_sizes);
     if( d_buffer==0 )
-    {
-        dreprog::destroy(prog);
-        RMM_FREE(d_repl,0);
         return rtn; // all strings are null
-    }
     // create offsets
     rmm::device_vector<size_t> offsets(count,0);
     thrust::exclusive_scan(execpol->on(0),sizes.begin(),sizes.end(),offsets.begin());
-    // do the replace
+    // do the thing
     custring_view_array d_results = rtn->pImpl->getStringsPtr();
     size_t* d_offsets = offsets.data().get();
-    if( (regex_insts > MAX_STACK_INSTS) || (regex_insts <= 10) )
-        thrust::for_each_n(execpol->on(0), thrust::make_counting_iterator<unsigned int>(0), count,
-            backrefs_fn<RX_STACK_SMALL>{prog, d_strings, d_repl, rsz, d_offsets, d_brefs, refcount, d_buffer, d_results});
-    else if( regex_insts <= 100 )
-        thrust::for_each_n(execpol->on(0), thrust::make_counting_iterator<unsigned int>(0), count,
-            backrefs_fn<RX_STACK_MEDIUM>{prog, d_strings, d_repl, rsz, d_offsets, d_brefs, refcount, d_buffer, d_results});
-    else
-        thrust::for_each_n(execpol->on(0), thrust::make_counting_iterator<unsigned int>(0), count,
-            backrefs_fn<RX_STACK_LARGE>{prog, d_strings, d_repl, rsz, d_offsets, d_brefs, refcount, d_buffer, d_results});
-
+    thrust::for_each_n(execpol->on(0), thrust::make_counting_iterator<unsigned int>(0), count,
+        replace_multi_fn{d_strings, d_targets, target_count, d_repls, repl_count, d_offsets, false, d_buffer, d_results });
     //
-    dreprog::destroy(prog);
-    RMM_FREE(d_repl,0);
     return rtn;
 }
 
@@ -664,9 +397,8 @@ NVStrings* NVStrings::fillna( const char* str )
     auto execpol = rmm::exec_policy(0);
     unsigned int ssz = (unsigned int)strlen(str);
     unsigned int asz = custring_view::alloc_size(str,ssz);
-    char* d_str = nullptr;
-    RMM_ALLOC(&d_str,ssz+1,0);
-    cudaMemcpy(d_str,str,ssz+1,cudaMemcpyHostToDevice);
+    char* d_str = device_alloc<char>(ssz+1,0);
+    CUDA_TRY( cudaMemcpyAsync(d_str,str,ssz+1,cudaMemcpyHostToDevice))
 
     // compute size of the output
     unsigned int count = size();
@@ -763,9 +495,8 @@ NVStrings* NVStrings::insert( const char* repl, int start )
         throw std::invalid_argument("nvstrings::slice_replace parameter cannot be null");
     auto execpol = rmm::exec_policy(0);
     unsigned int replen = (unsigned int)strlen(repl);
-    char* d_repl = nullptr;
-    RMM_ALLOC(&d_repl,replen,0);
-    cudaMemcpy(d_repl,repl,replen,cudaMemcpyHostToDevice);
+    char* d_repl = device_alloc<char>(replen,0);
+    CUDA_TRY( cudaMemcpyAsync(d_repl,repl,replen,cudaMemcpyHostToDevice))
     // compute size of output buffer
     unsigned int count = size();
     custring_view_array d_strings = pImpl->getStringsPtr();

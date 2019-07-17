@@ -17,16 +17,15 @@
 #include <exception>
 #include <map>
 #include <cuda_runtime.h>
-#include <device_launch_parameters.h>
 #include <thrust/device_vector.h>
-#include <thrust/execution_policy.h>
 #include <thrust/for_each.h>
 #include <thrust/count.h>
 #include <rmm/rmm.h>
 #include <rmm/thrust_rmm_allocator.h>
 #include "NVStrings.h"
 #include "NVStringsImpl.h"
-#include "custring_view.cuh"
+#include "../custring_view.cuh"
+#include "../util.h"
 
 // used to index values in a timeparts array
 #define TP_YEAR        0
@@ -139,23 +138,17 @@ struct DTFormatCompiler
             template_string.append(ch,flen);
         }
         // create in device memory
-        size_t memsize = items.size() * sizeof(DTFormatItem);
-        RMM_ALLOC(&d_items,memsize,0);
-        cudaMemcpy(d_items, items.data(), memsize, cudaMemcpyHostToDevice);
+        size_t buffer_size = items.size() * sizeof(DTFormatItem);
+        d_items = reinterpret_cast<DTFormatItem*>(device_alloc<char>(buffer_size,0));
+        CUDA_TRY( cudaMemcpyAsync(d_items, items.data(), buffer_size, cudaMemcpyHostToDevice))
         DTProgram hprog{items.size(),d_items};
-        RMM_ALLOC(&d_prog,sizeof(DTProgram),0);
-        cudaMemcpy(d_prog,&hprog,sizeof(DTProgram),cudaMemcpyHostToDevice);
+        d_prog = reinterpret_cast<DTProgram*>(device_alloc<char>(sizeof(DTProgram),0));
+        CUDA_TRY( cudaMemcpyAsync(d_prog,&hprog,sizeof(DTProgram),cudaMemcpyHostToDevice))
         return d_prog;
     }
 
     // call valid only after compile
     size_t string_length() { return template_string.size(); }
-    //{
-    //    size_t size = 0;
-    //    for( size_t idx=0; idx < items.size(); ++idx )
-    //        size += items[idx].length;
-    //    return size;
-    //}
     const char* string_template() { return template_string.c_str(); }
 
     size_t size() { return items.size(); }
@@ -361,7 +354,7 @@ int NVStrings::timestamp2long( const char* format, timestamp_units units, unsign
     auto execpol = rmm::exec_policy(0);
     unsigned long* d_rtn = results;
     if( !bdevmem )
-        RMM_ALLOC(&d_rtn,count*sizeof(unsigned long),0);
+        d_rtn = device_alloc<unsigned long>(count,0);
 
     if( format==0 )
         format = "%Y-%m-%dT%H:%M:%SZ";
@@ -376,7 +369,7 @@ int NVStrings::timestamp2long( const char* format, timestamp_units units, unsign
     int zeros = thrust::count(execpol->on(0),d_rtn,d_rtn+count,0);
     if( !bdevmem )
     {
-        cudaMemcpy(results,d_rtn,sizeof(unsigned long)*count,cudaMemcpyDeviceToHost);
+        CUDA_TRY( cudaMemcpyAsync(results,d_rtn,sizeof(unsigned long)*count,cudaMemcpyDeviceToHost))
         RMM_FREE(d_rtn,0);
     }
     return (int)count-zeros;
@@ -652,12 +645,12 @@ NVStrings* NVStrings::long2timestamp( const unsigned long* values, unsigned int 
     unsigned char* d_nulls = (unsigned char*)nullbitmask;
     if( !bdevmem )
     {
-        RMM_ALLOC(&d_values,count*sizeof(unsigned long),0);
-        cudaMemcpy(d_values,values,count*sizeof(unsigned long),cudaMemcpyHostToDevice);
+        d_values = device_alloc<unsigned long>(count,0);
+        CUDA_TRY( cudaMemcpyAsync(d_values,values,count*sizeof(unsigned long),cudaMemcpyHostToDevice))
         if( nullbitmask )
         {
-            RMM_ALLOC(&d_nulls,((count+7)/8)*sizeof(unsigned char),0);
-            cudaMemcpy(d_nulls,nullbitmask,((count+7)/8)*sizeof(unsigned char),cudaMemcpyHostToDevice);
+            d_nulls = device_alloc<unsigned char>(((count+7)/8),0);
+            CUDA_TRY( cudaMemcpyAsync(d_nulls,nullbitmask,((count+7)/8)*sizeof(unsigned char),cudaMemcpyHostToDevice))
         }
     }
 

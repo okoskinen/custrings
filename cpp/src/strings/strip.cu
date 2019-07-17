@@ -15,16 +15,14 @@
 */
 
 #include <cuda_runtime.h>
-#include <device_launch_parameters.h>
 #include <thrust/device_vector.h>
-#include <thrust/execution_policy.h>
 #include <thrust/for_each.h>
 #include <rmm/rmm.h>
 #include <rmm/thrust_rmm_allocator.h>
 #include "NVStrings.h"
 #include "NVStringsImpl.h"
-#include "custring_view.cuh"
-
+#include "../custring_view.cuh"
+#include "../util.h"
 
 // remove the target characters from the beginning of each string
 NVStrings* NVStrings::lstrip( const char* to_strip )
@@ -37,8 +35,8 @@ NVStrings* NVStrings::lstrip( const char* to_strip )
     if( to_strip )
     {
         int len = (int)strlen(to_strip) + 1; // include null
-        RMM_ALLOC(&d_strip,len,0);
-        cudaMemcpy(d_strip,to_strip,len,cudaMemcpyHostToDevice);
+        d_strip = device_alloc<char>(len,0);
+        CUDA_TRY( cudaMemcpyAsync(d_strip,to_strip,len,cudaMemcpyHostToDevice))
     }
 
     // compute size of output buffer
@@ -94,8 +92,8 @@ NVStrings* NVStrings::strip( const char* to_strip )
     if( to_strip )
     {
         int len = (int)strlen(to_strip) + 1; // include null
-        RMM_ALLOC(&d_strip,len,0);
-        cudaMemcpy(d_strip,to_strip,len,cudaMemcpyHostToDevice);
+        d_strip = device_alloc<char>(len,0);
+        CUDA_TRY( cudaMemcpyAsync(d_strip,to_strip,len,cudaMemcpyHostToDevice))
     }
 
     // compute size of output buffer
@@ -151,8 +149,8 @@ NVStrings* NVStrings::rstrip( const char* to_strip )
     if( to_strip )
     {
         int len = (int)strlen(to_strip) + 1; // include null
-        RMM_ALLOC(&d_strip,len,0);
-        cudaMemcpy(d_strip,to_strip,len,cudaMemcpyHostToDevice);
+        d_strip = device_alloc<char>(len,0);
+        CUDA_TRY( cudaMemcpyAsync(d_strip,to_strip,len,cudaMemcpyHostToDevice))
     }
 
     // compute size of output buffer
